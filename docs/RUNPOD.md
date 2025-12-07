@@ -32,9 +32,15 @@ Deploy Lexia API on RunPod GPU cloud.
 Connect via Web Terminal and run:
 
 ```bash
-# Install dependencies
+# Install system dependencies
 apt-get update
 apt-get install -y python3-pip python3-venv postgresql redis-server ffmpeg libsndfile1 git
+
+# Install cuDNN 8 (required for faster-whisper with CUDA)
+wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.0-1_all.deb
+dpkg -i cuda-keyring_1.0-1_all.deb
+apt-get update
+apt-get install -y libcudnn8
 
 # Clone repository
 cd /workspace
@@ -47,10 +53,22 @@ source venv/bin/activate
 
 # Install Python packages
 pip install --upgrade pip wheel setuptools
-pip install torch==2.1.0 torchaudio==2.1.0 --index-url https://download.pytorch.org/whl/cu118
+
+# Install PyTorch 2.9 (required for vLLM)
+pip install torch==2.9.0 torchvision==0.24.0 torchaudio==2.9.0
+
+# Install vLLM
+pip install vllm
+
+# Install faster-whisper with compatible ctranslate2 (for CUDA support)
+pip install faster-whisper ctranslate2==4.4.0
+
+# Install other dependencies
 pip install "numpy<2"
-pip install vllm transformers accelerate safetensors sentencepiece tokenizers
-pip install faster-whisper ctranslate2 pyannote.audio speechbrain
+pip install transformers accelerate safetensors sentencepiece tokenizers
+pip install librosa soundfile httpx
+
+# Install project requirements
 pip install -r requirements.txt
 ```
 
@@ -135,23 +153,19 @@ EOF
 su - postgres -c "psql -d lexia -c \"INSERT INTO api_keys (id, key_hash, name, user_id, permissions, rate_limit, is_revoked, created_at, updated_at) VALUES (gen_random_uuid(), 'YOUR_HASH_HERE', 'Production Key', 'user-1', '[\\\"*\\\"]', 60, false, now(), now());\""
 ```
 
-### 7. Accept Pyannote License
-
-Before using diarization, accept the license on HuggingFace:
-1. Go to https://huggingface.co/pyannote/speaker-diarization-3.1
-2. Accept the license agreement
-3. Do the same for https://huggingface.co/pyannote/segmentation-3.0
-
-### 8. Create Startup Script
+### 7. Create Startup Script
 
 ```bash
 cat > /workspace/start.sh << 'EOF'
 #!/bin/bash
 set -e
 
-echo "Starting Lexia API..."
+echo "=========================================="
+echo "  Starting Lexia API - All Services"
+echo "=========================================="
 
-# Start services
+# Start system services
+echo "[1/5] Starting PostgreSQL and Redis..."
 service postgresql start
 service redis-server start
 sleep 2
@@ -159,6 +173,8 @@ sleep 2
 # Activate environment
 cd /workspace/API-Lexia
 source venv/bin/activate
+
+# Export all environment variables
 export PYTHONPATH=/workspace/API-Lexia
 export DATABASE_URL="postgresql+asyncpg://lexia:lexia123@localhost:5432/lexia"
 export REDIS_URL="redis://localhost:6379/0"
@@ -169,21 +185,43 @@ export STT_SERVICE_URL="http://localhost:8002"
 export STORAGE_BACKEND="local"
 export LOCAL_STORAGE_PATH="/workspace/API-Lexia/data"
 export HF_TOKEN="hf_your_huggingface_token_here"
-export WHISPER_MODEL="Gilbert-AI/gilbert-fr-source"
-export DIARIZATION_MODEL="MEscriva/gilbert-pyannote-diarization"
 
-# Start STT/Diarization server in background
-echo "Starting STT/Diarization server..."
+# STT Configuration (faster-whisper with CUDA)
+export USE_TRANSFORMERS=false
+export WHISPER_MODEL="large-v3"
+export DEVICE=cuda
+
+# Start STT server in background (uses ~3GB GPU)
+echo "[2/5] Starting STT server (Whisper large-v3)..."
 python -m uvicorn src.services.stt.server:app --host 0.0.0.0 --port 8002 &
-sleep 10
+STT_PID=$!
+sleep 15  # Wait for Whisper model to load
 
-# Start API in background
-echo "Starting FastAPI..."
+# Verify STT is running
+if curl -s http://localhost:8002/health > /dev/null; then
+    echo "  ✓ STT server started successfully"
+else
+    echo "  ✗ STT server failed to start"
+fi
+
+# Start API Gateway in background
+echo "[3/5] Starting API Gateway..."
 uvicorn src.api.main:app --host 0.0.0.0 --port 8000 &
+API_PID=$!
 sleep 5
 
-# Start vLLM (foreground, takes most memory)
-echo "Starting vLLM (this may take a few minutes)..."
+# Verify API is running
+if curl -s http://localhost:8000/health > /dev/null; then
+    echo "  ✓ API Gateway started successfully"
+else
+    echo "  ✗ API Gateway failed to start"
+fi
+
+# Start vLLM (foreground, uses ~20GB GPU)
+echo "[4/5] Starting vLLM (this takes 2-3 minutes)..."
+echo "  Model: Marsouuu/general7Bv2-ECE-PRYMMAL-Martial"
+echo "  GPU Memory: 50%"
+
 python -m vllm.entrypoints.openai.api_server \
   --model Marsouuu/general7Bv2-ECE-PRYMMAL-Martial \
   --port 8005 \
@@ -193,40 +231,40 @@ EOF
 chmod +x /workspace/start.sh
 ```
 
-### 9. Start Services
+> **Note**: Diarization is currently disabled due to torch version conflicts with vLLM.
+> It will be re-enabled when pyannote-audio supports torch 2.9.
+
+### 8. Start Services
 
 ```bash
 /workspace/start.sh
 ```
 
-Wait for all services to show `Application startup complete`.
+Wait for vLLM to show `Application startup complete`.
 
-### 10. Test API
+### 9. Test All Services
 
 ```bash
-# Health check
-curl http://localhost:8000/health
+# Health checks
+curl http://localhost:8000/health   # API Gateway
+curl http://localhost:8002/health   # STT Server
+curl http://localhost:8005/health   # vLLM
 
-# Chat completion (LLM)
+# Test LLM (Chat completion)
 curl -X POST http://localhost:8000/v1/chat/completions \
   -H "Authorization: Bearer lx_your_secure_api_key_here_min_40_chars" \
   -H "Content-Type: application/json" \
   -d '{"model":"general7Bv2","messages":[{"role":"user","content":"Bonjour!"}]}'
 
-# STT server health
-curl http://localhost:8002/health
+# Test STT directly (without API Gateway)
+curl -X POST http://localhost:8002/transcribe \
+  -F "audio=@/path/to/audio.wav"
 
-# Test STT (create test audio first)
-ffmpeg -f lavfi -i "sine=frequency=440:duration=3" -ar 16000 /tmp/test.wav
+# Test STT via API Gateway
 curl -X POST http://localhost:8000/v1/transcriptions/sync \
   -H "Authorization: Bearer lx_your_secure_api_key_here_min_40_chars" \
-  -F "audio=@/tmp/test.wav" \
+  -F "audio=@/path/to/audio.wav" \
   -F "language_code=fr"
-
-# Test Diarization
-curl -X POST http://localhost:8000/v1/diarization/sync \
-  -H "Authorization: Bearer lx_your_secure_api_key_here_min_40_chars" \
-  -F "audio=@/tmp/test.wav"
 ```
 
 ## External Access
@@ -297,19 +335,24 @@ fuser -k 8005/tcp
 │                                                             │
 │  ┌──────────────────┐                                      │
 │  │   API Gateway    │  Port 8000                           │
-│  │    (FastAPI)     │  No GPU needed                       │
+│  │    (FastAPI)     │  Stateless, no GPU                   │
 │  └────────┬─────────┘                                      │
 │           │                                                 │
 │     ┌─────┴─────┐                                          │
 │     ▼           ▼                                           │
 │  ┌──────────┐  ┌──────────────────┐                        │
-│  │   vLLM   │  │  STT/Diarization │                        │
-│  │  :8005   │  │      :8002       │                        │
-│  │  ~20GB   │  │      ~5GB        │                        │
-│  │          │  │  Whisper+Pyannote│                        │
+│  │   vLLM   │  │   STT Server     │                        │
+│  │  :8005   │  │     :8002        │                        │
+│  │  ~20GB   │  │     ~3GB         │                        │
+│  │  7B LLM  │  │  Whisper v3      │                        │
 │  └──────────┘  └──────────────────┘                        │
 │                                                             │
-│  GPU Memory: ~25GB / 46GB available                        │
+│  GPU Memory: ~23GB / 46GB available                        │
+│                                                             │
+│  Tech Stack:                                               │
+│  - vLLM 0.12 + torch 2.9.0                                │
+│  - faster-whisper + ctranslate2 4.4.0                     │
+│  - cuDNN 8 (libcudnn8)                                    │
 └─────────────────────────────────────────────────────────────┘
 ```
 
