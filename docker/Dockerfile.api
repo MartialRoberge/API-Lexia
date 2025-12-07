@@ -1,0 +1,87 @@
+# =============================================================================
+# Lexia API - FastAPI Application
+# =============================================================================
+# Multi-stage build for optimized production image
+# Build: docker build -f docker/Dockerfile.api -t lexia-api:latest .
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Stage 1: Builder
+# -----------------------------------------------------------------------------
+FROM python:3.11-slim as builder
+
+WORKDIR /build
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create virtual environment
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip wheel setuptools \
+    && pip install --no-cache-dir -r requirements.txt
+
+# -----------------------------------------------------------------------------
+# Stage 2: Production
+# -----------------------------------------------------------------------------
+FROM python:3.11-slim as production
+
+# Labels
+LABEL org.opencontainers.image.title="Lexia API"
+LABEL org.opencontainers.image.description="Production API for LLM, STT and Diarization"
+LABEL org.opencontainers.image.version="1.0.0"
+LABEL org.opencontainers.image.vendor="Lexia"
+
+# Environment variables
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app/src \
+    PATH="/opt/venv/bin:$PATH" \
+    # Application settings
+    APP_ENV=production \
+    APP_HOST=0.0.0.0 \
+    APP_PORT=8000 \
+    APP_WORKERS=4
+
+WORKDIR /app
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libsndfile1 \
+    ffmpeg \
+    curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Copy virtual environment from builder
+COPY --from=builder /opt/venv /opt/venv
+
+# Create non-root user for security
+RUN groupadd --gid 1000 lexia \
+    && useradd --uid 1000 --gid 1000 --shell /bin/bash --create-home lexia \
+    && mkdir -p /app/data /app/logs /app/tmp \
+    && chown -R lexia:lexia /app
+
+# Copy application code
+COPY --chown=lexia:lexia src/ /app/src/
+COPY --chown=lexia:lexia alembic/ /app/alembic/
+COPY --chown=lexia:lexia alembic.ini /app/
+
+# Switch to non-root user
+USER lexia
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:${APP_PORT}/health || exit 1
+
+# Expose port
+EXPOSE ${APP_PORT}
+
+# Run application
+CMD ["sh", "-c", "uvicorn src.api.main:app --host ${APP_HOST} --port ${APP_PORT} --workers ${APP_WORKERS}"]

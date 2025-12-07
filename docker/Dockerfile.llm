@@ -1,0 +1,109 @@
+# =============================================================================
+# Lexia API - vLLM Inference Server
+# =============================================================================
+# GPU-optimized image for LLM inference with vLLM
+# Requires NVIDIA GPU with CUDA support
+# Build: docker build -f docker/Dockerfile.llm -t lexia-llm:latest .
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Base image with CUDA support
+# -----------------------------------------------------------------------------
+FROM nvidia/cuda:12.1.1-devel-ubuntu22.04 as base
+
+# Prevent interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 \
+    python3.11-venv \
+    python3.11-dev \
+    python3-pip \
+    build-essential \
+    curl \
+    git \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.11 /usr/bin/python
+
+# -----------------------------------------------------------------------------
+# Builder stage
+# -----------------------------------------------------------------------------
+FROM base as builder
+
+WORKDIR /build
+
+# Create virtual environment
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Install vLLM and dependencies
+RUN pip install --no-cache-dir --upgrade pip wheel setuptools \
+    && pip install --no-cache-dir \
+    vllm>=0.3.0 \
+    torch>=2.1.0 \
+    transformers>=4.37.0 \
+    accelerate>=0.26.0 \
+    safetensors>=0.4.0 \
+    sentencepiece>=0.1.99 \
+    httpx>=0.26.0 \
+    fastapi>=0.109.0 \
+    uvicorn[standard]>=0.27.0
+
+# -----------------------------------------------------------------------------
+# Production stage
+# -----------------------------------------------------------------------------
+FROM nvidia/cuda:12.1.1-runtime-ubuntu22.04 as production
+
+# Labels
+LABEL org.opencontainers.image.title="Lexia LLM Server"
+LABEL org.opencontainers.image.description="vLLM inference server for Lexia API"
+LABEL org.opencontainers.image.version="1.0.0"
+
+# Environment variables
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH="/opt/venv/bin:$PATH" \
+    # vLLM settings
+    VLLM_HOST=0.0.0.0 \
+    VLLM_PORT=8001 \
+    # Model settings
+    MODEL_NAME="Marsouuu/general7Bv2-ECE-PRYMMAL-Martial" \
+    MODEL_DTYPE="auto" \
+    MAX_MODEL_LEN=4096 \
+    GPU_MEMORY_UTILIZATION=0.9 \
+    # Hugging Face cache
+    HF_HOME=/app/models \
+    TRANSFORMERS_CACHE=/app/models
+
+WORKDIR /app
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 \
+    curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.11 /usr/bin/python
+
+# Copy virtual environment
+COPY --from=builder /opt/venv /opt/venv
+
+# Create directories and user
+RUN groupadd --gid 1000 lexia \
+    && useradd --uid 1000 --gid 1000 --shell /bin/bash --create-home lexia \
+    && mkdir -p /app/models /app/logs \
+    && chown -R lexia:lexia /app
+
+# Copy entrypoint script
+COPY --chown=lexia:lexia docker/scripts/llm-entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+USER lexia
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=30s --start-period=120s --retries=3 \
+    CMD curl -f http://localhost:${VLLM_PORT}/health || exit 1
+
+EXPOSE ${VLLM_PORT}
+
+ENTRYPOINT ["/app/entrypoint.sh"]

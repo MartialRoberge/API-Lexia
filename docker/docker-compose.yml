@@ -1,0 +1,298 @@
+# =============================================================================
+# Lexia API - Production Docker Compose
+# =============================================================================
+# Full production stack with GPU support
+# Deploy: docker compose -f docker/docker-compose.yml up -d
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # API Gateway - FastAPI Application
+  # ---------------------------------------------------------------------------
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.api
+    image: lexia-api:${TAG:-latest}
+    container_name: lexia-api
+    restart: unless-stopped
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      - APP_ENV=production
+      - APP_DEBUG=false
+      - APP_WORKERS=${API_WORKERS:-4}
+      # Database
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-lexia}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-lexia}
+      # Redis
+      - REDIS_URL=redis://redis:6379/0
+      # Internal services
+      - LLM_SERVICE_URL=http://llm:8001
+      - STT_SERVICE_URL=http://stt:8002
+      # Storage
+      - STORAGE_BACKEND=${STORAGE_BACKEND:-s3}
+      - S3_ENDPOINT_URL=${S3_ENDPOINT_URL}
+      - S3_ACCESS_KEY=${S3_ACCESS_KEY}
+      - S3_SECRET_KEY=${S3_SECRET_KEY}
+      - S3_BUCKET_NAME=${S3_BUCKET_NAME:-lexia-audio}
+      - S3_REGION=${S3_REGION:-eu-west-1}
+      # Security
+      - API_SECRET_KEY=${API_SECRET_KEY}
+      - API_KEY_SALT=${API_KEY_SALT}
+    volumes:
+      - api-logs:/app/logs
+      - audio-data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - lexia-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # LLM Service - vLLM Inference Server
+  # ---------------------------------------------------------------------------
+  llm:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.llm
+    image: lexia-llm:${TAG:-latest}
+    container_name: lexia-llm
+    restart: unless-stopped
+    ports:
+      - "${LLM_PORT:-8001}:8001"
+    environment:
+      - MODEL_NAME=${LLM_MODEL:-Marsouuu/general7Bv2-ECE-PRYMMAL-Martial}
+      - MODEL_DTYPE=${LLM_DTYPE:-auto}
+      - MAX_MODEL_LEN=${LLM_MAX_LEN:-4096}
+      - GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTIL:-0.9}
+      - TENSOR_PARALLEL_SIZE=${TENSOR_PARALLEL:-1}
+      - HF_TOKEN=${HF_TOKEN}
+    volumes:
+      - llm-models:/app/models
+      - llm-logs:/app/logs
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${LLM_GPU_COUNT:-1}
+              capabilities: [gpu]
+    networks:
+      - lexia-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 30s
+      retries: 3
+      start_period: 180s
+
+  # ---------------------------------------------------------------------------
+  # STT Service - Whisper + Pyannote
+  # ---------------------------------------------------------------------------
+  stt:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.stt
+    image: lexia-stt:${TAG:-latest}
+    container_name: lexia-stt
+    restart: unless-stopped
+    ports:
+      - "${STT_PORT:-8002}:8002"
+    environment:
+      - WHISPER_MODEL=${WHISPER_MODEL:-Gilbert-AI/gilbert-fr-source}
+      - DIARIZATION_MODEL=${DIARIZATION_MODEL:-MEscriva/gilbert-pyannote-diarization}
+      - DEVICE=cuda
+      - COMPUTE_TYPE=float16
+      - HF_TOKEN=${HF_TOKEN}
+    volumes:
+      - stt-models:/app/models
+      - stt-logs:/app/logs
+      - audio-tmp:/app/tmp
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${STT_GPU_COUNT:-1}
+              capabilities: [gpu]
+    networks:
+      - lexia-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 30s
+      timeout: 30s
+      retries: 3
+      start_period: 180s
+
+  # ---------------------------------------------------------------------------
+  # Celery Worker - Async Job Processing
+  # ---------------------------------------------------------------------------
+  worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.worker
+    image: lexia-worker:${TAG:-latest}
+    container_name: lexia-worker
+    restart: unless-stopped
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - CELERY_CONCURRENCY=${WORKER_CONCURRENCY:-4}
+      # Database
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-lexia}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-lexia}
+      # Internal services
+      - LLM_SERVICE_URL=http://llm:8001
+      - STT_SERVICE_URL=http://stt:8002
+      # Storage
+      - STORAGE_BACKEND=${STORAGE_BACKEND:-s3}
+      - S3_ENDPOINT_URL=${S3_ENDPOINT_URL}
+      - S3_ACCESS_KEY=${S3_ACCESS_KEY}
+      - S3_SECRET_KEY=${S3_SECRET_KEY}
+      - S3_BUCKET_NAME=${S3_BUCKET_NAME:-lexia-audio}
+    volumes:
+      - worker-logs:/app/logs
+      - audio-data:/app/data
+    depends_on:
+      - redis
+      - postgres
+      - llm
+      - stt
+    networks:
+      - lexia-network
+
+  # ---------------------------------------------------------------------------
+  # Celery Beat - Scheduled Tasks
+  # ---------------------------------------------------------------------------
+  beat:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.worker
+    image: lexia-worker:${TAG:-latest}
+    container_name: lexia-beat
+    restart: unless-stopped
+    command: celery -A src.workers.celery_app beat --loglevel=info
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-lexia}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-lexia}
+    depends_on:
+      - redis
+      - worker
+    networks:
+      - lexia-network
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL Database
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: lexia-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-lexia}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB:-lexia}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    networks:
+      - lexia-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-lexia} -d ${POSTGRES_DB:-lexia}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # Redis - Cache & Message Broker
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: lexia-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-data:/data
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    networks:
+      - lexia-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # MinIO - S3-compatible Object Storage (optional, for self-hosted)
+  # ---------------------------------------------------------------------------
+  minio:
+    image: minio/minio:latest
+    container_name: lexia-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER:-minioadmin}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - minio-data:/data
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    networks:
+      - lexia-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    profiles:
+      - storage
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  lexia-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  postgres-data:
+    driver: local
+  redis-data:
+    driver: local
+  llm-models:
+    driver: local
+  stt-models:
+    driver: local
+  api-logs:
+    driver: local
+  llm-logs:
+    driver: local
+  stt-logs:
+    driver: local
+  worker-logs:
+    driver: local
+  audio-data:
+    driver: local
+  audio-tmp:
+    driver: local
+  minio-data:
+    driver: local

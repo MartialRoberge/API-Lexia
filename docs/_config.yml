@@ -1,0 +1,28 @@
+title: Lexia API
+description: Production-ready API for LLM, Speech-to-Text, and Speaker Diarization
+theme: jekyll-theme-cayman
+remote_theme: pages-themes/cayman@v0.2.0
+plugins:
+  - jekyll-remote-theme
+
+# Site settings
+baseurl: "/API-Lexia"
+url: ""
+
+# Navigation
+nav:
+  - title: Home
+    url: /
+  - title: API Reference
+    url: /API
+  - title: Deployment
+    url: /DEPLOYMENT
+  - title: GitHub
+    url: https://github.com/yourusername/API-Lexia
+
+# Markdown settings
+markdown: kramdown
+highlighter: rouge
+kramdown:
+  input: GFM
+  syntax_highlighter: rouge

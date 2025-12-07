@@ -1,0 +1,182 @@
+# =============================================================================
+# Lexia API - Development Docker Compose
+# =============================================================================
+# Development stack with mock services (no GPU required)
+# Deploy: docker compose -f docker/docker-compose.dev.yml up -d
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # API Gateway - Development Mode
+  # ---------------------------------------------------------------------------
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.api
+    image: lexia-api:dev
+    container_name: lexia-api-dev
+    ports:
+      - "8000:8000"
+    environment:
+      - APP_ENV=development
+      - APP_DEBUG=true
+      - APP_WORKERS=1
+      # Database
+      - DATABASE_URL=postgresql+asyncpg://lexia:lexia_dev@postgres:5432/lexia_dev
+      # Redis
+      - REDIS_URL=redis://redis:6379/0
+      # Mock mode - no GPU services
+      - USE_MOCK_LLM=true
+      - USE_MOCK_STT=true
+      - USE_MOCK_DIARIZATION=true
+      # Storage - local filesystem
+      - STORAGE_BACKEND=local
+      - LOCAL_STORAGE_PATH=/app/data
+      # Security
+      - API_SECRET_KEY=dev-secret-key-change-in-production
+      - API_KEY_SALT=dev-salt-change-in-production
+    volumes:
+      - ../src:/app/src:ro
+      - dev-audio-data:/app/data
+      - dev-logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - lexia-dev-network
+    # Hot reload for development
+    command: uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # ---------------------------------------------------------------------------
+  # Celery Worker - Development
+  # ---------------------------------------------------------------------------
+  worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.worker
+    image: lexia-worker:dev
+    container_name: lexia-worker-dev
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - CELERY_CONCURRENCY=2
+      - DATABASE_URL=postgresql+asyncpg://lexia:lexia_dev@postgres:5432/lexia_dev
+      - USE_MOCK_LLM=true
+      - USE_MOCK_STT=true
+      - STORAGE_BACKEND=local
+      - LOCAL_STORAGE_PATH=/app/data
+    volumes:
+      - ../src:/app/src:ro
+      - dev-audio-data:/app/data
+    depends_on:
+      - redis
+      - postgres
+    networks:
+      - lexia-dev-network
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL - Development
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: lexia-postgres-dev
+    environment:
+      - POSTGRES_USER=lexia
+      - POSTGRES_PASSWORD=lexia_dev
+      - POSTGRES_DB=lexia_dev
+    volumes:
+      - dev-postgres-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - lexia-dev-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lexia -d lexia_dev"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # Redis - Development
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: lexia-redis-dev
+    command: redis-server --appendonly yes
+    volumes:
+      - dev-redis-data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - lexia-dev-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # MinIO - Local S3 for Development
+  # ---------------------------------------------------------------------------
+  minio:
+    image: minio/minio:latest
+    container_name: lexia-minio-dev
+    command: server /data --console-address ":9001"
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    volumes:
+      - dev-minio-data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    networks:
+      - lexia-dev-network
+
+  # ---------------------------------------------------------------------------
+  # pgAdmin - Database Management UI (optional)
+  # ---------------------------------------------------------------------------
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: lexia-pgadmin-dev
+    environment:
+      - PGADMIN_DEFAULT_EMAIL=admin@lexia.local
+      - PGADMIN_DEFAULT_PASSWORD=admin
+    ports:
+      - "5050:80"
+    depends_on:
+      - postgres
+    networks:
+      - lexia-dev-network
+    profiles:
+      - tools
+
+  # ---------------------------------------------------------------------------
+  # Redis Commander - Redis Management UI (optional)
+  # ---------------------------------------------------------------------------
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: lexia-redis-commander-dev
+    environment:
+      - REDIS_HOSTS=local:redis:6379
+    ports:
+      - "8081:8081"
+    depends_on:
+      - redis
+    networks:
+      - lexia-dev-network
+    profiles:
+      - tools
+
+networks:
+  lexia-dev-network:
+    driver: bridge
+
+volumes:
+  dev-postgres-data:
+  dev-redis-data:
+  dev-minio-data:
+  dev-audio-data:
+  dev-logs:

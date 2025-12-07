@@ -1,0 +1,135 @@
+# =============================================================================
+# Lexia API - Testing Stack
+# =============================================================================
+# Usage: docker compose -f docker-compose.test.yml run --rm test
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # Test Runner
+  # ---------------------------------------------------------------------------
+  test:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.test
+    environment:
+      - PYTHONPATH=/app
+      - APP_ENV=testing
+      - APP_DEBUG=true
+      - API_SECRET_KEY=test-secret-key
+      - API_KEY_SALT=test-salt
+      - DATABASE_URL=postgresql+asyncpg://lexia:lexia_test@postgres:5432/lexia_test
+      - REDIS_URL=redis://redis:6379/1
+      - USE_MOCK_LLM=true
+      - USE_MOCK_STT=true
+      - USE_MOCK_DIARIZATION=true
+      - STORAGE_BACKEND=local
+      - LOCAL_STORAGE_PATH=/tmp/test-storage
+    volumes:
+      - ../src:/app/src:ro
+      - ../tests:/app/tests:ro
+      - test-coverage:/app/coverage_report
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - test-network
+    command: >
+      pytest tests/ -v
+      --tb=short
+      --cov=src
+      --cov-report=term-missing
+      --cov-report=html:coverage_report
+      --cov-fail-under=50
+
+  # ---------------------------------------------------------------------------
+  # Security Scanner
+  # ---------------------------------------------------------------------------
+  security:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.test
+    volumes:
+      - ../src:/app/src:ro
+      - security-report:/app/security_report
+    command: >
+      sh -c "
+        echo '=== Running Bandit Security Scan ===' &&
+        bandit -r src/ -ll -f json -o security_report/bandit.json || true &&
+        bandit -r src/ -ll &&
+        echo '' &&
+        echo '=== Checking for vulnerable dependencies ===' &&
+        pip-audit --strict || true
+      "
+
+  # ---------------------------------------------------------------------------
+  # Type Checker
+  # ---------------------------------------------------------------------------
+  typecheck:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.test
+    volumes:
+      - ../src:/app/src:ro
+    command: mypy src/ --ignore-missing-imports --strict
+
+  # ---------------------------------------------------------------------------
+  # Linter
+  # ---------------------------------------------------------------------------
+  lint:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.test
+    volumes:
+      - ../src:/app/src:ro
+      - ../tests:/app/tests:ro
+    command: >
+      sh -c "
+        echo '=== Running Ruff ===' &&
+        ruff check src/ tests/ &&
+        echo '' &&
+        echo '=== Checking Black formatting ===' &&
+        black --check src/ tests/
+      "
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL for Tests
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: lexia
+      POSTGRES_PASSWORD: lexia_test
+      POSTGRES_DB: lexia_test
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lexia -d lexia_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - test-network
+    tmpfs:
+      - /var/lib/postgresql/data
+
+  # ---------------------------------------------------------------------------
+  # Redis for Tests
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - test-network
+
+networks:
+  test-network:
+    driver: bridge
+
+volumes:
+  test-coverage:
+  security-report:

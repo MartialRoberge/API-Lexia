@@ -1,0 +1,120 @@
+# =============================================================================
+# Lexia API - Speech-to-Text & Diarization Server
+# =============================================================================
+# GPU-optimized image for Whisper STT and Pyannote Diarization
+# Build: docker build -f docker/Dockerfile.stt -t lexia-stt:latest .
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Base image with CUDA support
+# -----------------------------------------------------------------------------
+FROM nvidia/cuda:12.1.1-devel-ubuntu22.04 as base
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 \
+    python3.11-venv \
+    python3.11-dev \
+    python3-pip \
+    build-essential \
+    curl \
+    git \
+    ffmpeg \
+    libsndfile1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.11 /usr/bin/python
+
+# -----------------------------------------------------------------------------
+# Builder stage
+# -----------------------------------------------------------------------------
+FROM base as builder
+
+WORKDIR /build
+
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Install STT and Diarization dependencies
+RUN pip install --no-cache-dir --upgrade pip wheel setuptools \
+    && pip install --no-cache-dir \
+    # Core
+    torch>=2.1.0 \
+    torchaudio>=2.1.0 \
+    transformers>=4.37.0 \
+    # Whisper
+    faster-whisper>=0.10.0 \
+    ctranslate2>=4.0.0 \
+    # Diarization
+    pyannote.audio>=3.1.0 \
+    speechbrain>=1.0.0 \
+    # Audio processing
+    librosa>=0.10.1 \
+    soundfile>=0.12.1 \
+    pydub>=0.25.1 \
+    # API
+    fastapi>=0.109.0 \
+    uvicorn[standard]>=0.27.0 \
+    python-multipart>=0.0.6 \
+    httpx>=0.26.0 \
+    websockets>=12.0 \
+    # Utils
+    numpy>=1.26.0 \
+    pydantic>=2.5.0 \
+    structlog>=24.1.0
+
+# -----------------------------------------------------------------------------
+# Production stage
+# -----------------------------------------------------------------------------
+FROM nvidia/cuda:12.1.1-runtime-ubuntu22.04 as production
+
+LABEL org.opencontainers.image.title="Lexia STT Server"
+LABEL org.opencontainers.image.description="Whisper STT and Pyannote Diarization server"
+LABEL org.opencontainers.image.version="1.0.0"
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH="/opt/venv/bin:$PATH" \
+    # Server settings
+    STT_HOST=0.0.0.0 \
+    STT_PORT=8002 \
+    # Model settings
+    WHISPER_MODEL="Gilbert-AI/gilbert-fr-source" \
+    DIARIZATION_MODEL="MEscriva/gilbert-pyannote-diarization" \
+    DEVICE="cuda" \
+    COMPUTE_TYPE="float16" \
+    # Hugging Face
+    HF_HOME=/app/models \
+    HF_TOKEN=""
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 \
+    ffmpeg \
+    libsndfile1 \
+    curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.11 /usr/bin/python
+
+COPY --from=builder /opt/venv /opt/venv
+
+RUN groupadd --gid 1000 lexia \
+    && useradd --uid 1000 --gid 1000 --shell /bin/bash --create-home lexia \
+    && mkdir -p /app/models /app/logs /app/tmp \
+    && chown -R lexia:lexia /app
+
+# Copy STT service code
+COPY --chown=lexia:lexia src/services/stt/ /app/src/services/stt/
+COPY --chown=lexia:lexia src/services/diarization/ /app/src/services/diarization/
+COPY --chown=lexia:lexia docker/scripts/stt-entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+USER lexia
+
+HEALTHCHECK --interval=30s --timeout=30s --start-period=120s --retries=3 \
+    CMD curl -f http://localhost:${STT_PORT}/health || exit 1
+
+EXPOSE ${STT_PORT}
+
+ENTRYPOINT ["/app/entrypoint.sh"]

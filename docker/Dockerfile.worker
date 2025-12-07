@@ -1,0 +1,66 @@
+# =============================================================================
+# Lexia API - Celery Worker
+# =============================================================================
+# Worker for async job processing (long transcriptions, batch processing)
+# Build: docker build -f docker/Dockerfile.worker -t lexia-worker:latest .
+# =============================================================================
+
+FROM python:3.11-slim as builder
+
+WORKDIR /build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip wheel setuptools \
+    && pip install --no-cache-dir -r requirements.txt
+
+# -----------------------------------------------------------------------------
+# Production stage
+# -----------------------------------------------------------------------------
+FROM python:3.11-slim as production
+
+LABEL org.opencontainers.image.title="Lexia Worker"
+LABEL org.opencontainers.image.description="Celery worker for async job processing"
+LABEL org.opencontainers.image.version="1.0.0"
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app/src \
+    PATH="/opt/venv/bin:$PATH" \
+    # Celery settings
+    CELERY_BROKER_URL="redis://redis:6379/0" \
+    CELERY_RESULT_BACKEND="redis://redis:6379/0" \
+    CELERY_CONCURRENCY=4 \
+    CELERY_QUEUE="default"
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libsndfile1 \
+    ffmpeg \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /opt/venv /opt/venv
+
+RUN groupadd --gid 1000 lexia \
+    && useradd --uid 1000 --gid 1000 --shell /bin/bash --create-home lexia \
+    && mkdir -p /app/data /app/logs \
+    && chown -R lexia:lexia /app
+
+COPY --chown=lexia:lexia src/ /app/src/
+
+USER lexia
+
+# Health check via celery inspect
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD celery -A src.workers.celery_app inspect ping -d celery@$HOSTNAME || exit 1
+
+CMD ["sh", "-c", "celery -A src.workers.celery_app worker --loglevel=info --concurrency=${CELERY_CONCURRENCY} -Q ${CELERY_QUEUE}"]
