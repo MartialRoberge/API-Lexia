@@ -308,12 +308,26 @@ class PyannoteBackend(DiarizationBackend):
                 response.raise_for_status()
                 data = response.json()
 
-            # Parse response (implementation depends on service format)
-            # This is a placeholder - adjust based on actual service response
+            # Parse response from STT server
+            from src.models.stt import Speaker, OverlapSegment, DiarizationStats
+
+            speakers = [Speaker(**s) for s in data.get("speakers", [])]
+            segments = [
+                SpeakerSegment(**s) for s in data.get("segments", [])
+            ]
+            overlaps = [
+                OverlapSegment(**o) for o in data.get("overlaps", [])
+            ]
+            stats = None
+            if data.get("stats"):
+                stats = DiarizationStats(**data["stats"])
+
             return DiarizationResult(
-                speakers=[],
-                segments=[],
-                overlaps=[],
+                speakers=speakers,
+                segments=segments,
+                overlaps=overlaps,
+                stats=stats,
+                rttm=data.get("rttm"),
             )
 
         except httpx.HTTPStatusError as e:

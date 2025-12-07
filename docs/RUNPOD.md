@@ -135,7 +135,14 @@ EOF
 su - postgres -c "psql -d lexia -c \"INSERT INTO api_keys (id, key_hash, name, user_id, permissions, rate_limit, is_revoked, created_at, updated_at) VALUES (gen_random_uuid(), 'YOUR_HASH_HERE', 'Production Key', 'user-1', '[\\\"*\\\"]', 60, false, now(), now());\""
 ```
 
-### 7. Create Startup Script
+### 7. Accept Pyannote License
+
+Before using diarization, accept the license on HuggingFace:
+1. Go to https://huggingface.co/pyannote/speaker-diarization-3.1
+2. Accept the license agreement
+3. Do the same for https://huggingface.co/pyannote/segmentation-3.0
+
+### 8. Create Startup Script
 
 ```bash
 cat > /workspace/start.sh << 'EOF'
@@ -158,44 +165,68 @@ export REDIS_URL="redis://localhost:6379/0"
 export API_SECRET_KEY="your-secret-key-minimum-32-characters-here"
 export API_KEY_SALT="your-salt-16-chars"
 export LLM_SERVICE_URL="http://localhost:8005"
+export STT_SERVICE_URL="http://localhost:8002"
 export STORAGE_BACKEND="local"
 export LOCAL_STORAGE_PATH="/workspace/API-Lexia/data"
 export HF_TOKEN="hf_your_huggingface_token_here"
+export WHISPER_MODEL="Gilbert-AI/gilbert-fr-source"
+export DIARIZATION_MODEL="MEscriva/gilbert-pyannote-diarization"
+
+# Start STT/Diarization server in background
+echo "Starting STT/Diarization server..."
+python -m uvicorn src.services.stt.server:app --host 0.0.0.0 --port 8002 &
+sleep 10
 
 # Start API in background
 echo "Starting FastAPI..."
 uvicorn src.api.main:app --host 0.0.0.0 --port 8000 &
 sleep 5
 
-# Start vLLM
+# Start vLLM (foreground, takes most memory)
 echo "Starting vLLM (this may take a few minutes)..."
 python -m vllm.entrypoints.openai.api_server \
   --model Marsouuu/general7Bv2-ECE-PRYMMAL-Martial \
-  --port 8005
+  --port 8005 \
+  --gpu-memory-utilization 0.5
 
 EOF
 chmod +x /workspace/start.sh
 ```
 
-### 8. Start Services
+### 9. Start Services
 
 ```bash
 /workspace/start.sh
 ```
 
-Wait for vLLM to show `Application startup complete`.
+Wait for all services to show `Application startup complete`.
 
-### 9. Test API
+### 10. Test API
 
 ```bash
 # Health check
 curl http://localhost:8000/health
 
-# Chat completion
+# Chat completion (LLM)
 curl -X POST http://localhost:8000/v1/chat/completions \
   -H "Authorization: Bearer lx_your_secure_api_key_here_min_40_chars" \
   -H "Content-Type: application/json" \
   -d '{"model":"general7Bv2","messages":[{"role":"user","content":"Bonjour!"}]}'
+
+# STT server health
+curl http://localhost:8002/health
+
+# Test STT (create test audio first)
+ffmpeg -f lavfi -i "sine=frequency=440:duration=3" -ar 16000 /tmp/test.wav
+curl -X POST http://localhost:8000/v1/transcriptions/sync \
+  -H "Authorization: Bearer lx_your_secure_api_key_here_min_40_chars" \
+  -F "audio=@/tmp/test.wav" \
+  -F "language_code=fr"
+
+# Test Diarization
+curl -X POST http://localhost:8000/v1/diarization/sync \
+  -H "Authorization: Bearer lx_your_secure_api_key_here_min_40_chars" \
+  -F "audio=@/tmp/test.wav"
 ```
 
 ## External Access
@@ -242,6 +273,7 @@ PGPASSWORD=lexia123 psql -U lexia -d lexia -h localhost -c "SELECT 1;"
 # Find and kill process
 apt-get install -y psmisc
 fuser -k 8000/tcp
+fuser -k 8002/tcp
 fuser -k 8005/tcp
 ```
 
@@ -250,9 +282,54 @@ fuser -k 8005/tcp
 | Service | Port | Command to Check |
 |---------|------|------------------|
 | API | 8000 | `curl localhost:8000/health` |
+| STT/Diarization | 8002 | `curl localhost:8002/health` |
 | vLLM | 8005 | `curl localhost:8005/health` |
 | PostgreSQL | 5432 | `service postgresql status` |
 | Redis | 6379 | `service redis-server status` |
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    RunPod Single Pod                        │
+│                      A40 (46GB)                            │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  ┌──────────────────┐                                      │
+│  │   API Gateway    │  Port 8000                           │
+│  │    (FastAPI)     │  No GPU needed                       │
+│  └────────┬─────────┘                                      │
+│           │                                                 │
+│     ┌─────┴─────┐                                          │
+│     ▼           ▼                                           │
+│  ┌──────────┐  ┌──────────────────┐                        │
+│  │   vLLM   │  │  STT/Diarization │                        │
+│  │  :8005   │  │      :8002       │                        │
+│  │  ~20GB   │  │      ~5GB        │                        │
+│  │          │  │  Whisper+Pyannote│                        │
+│  └──────────┘  └──────────────────┘                        │
+│                                                             │
+│  GPU Memory: ~25GB / 46GB available                        │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Scaling (Production)
+
+For production with multiple GPUs/pods:
+
+```bash
+# Pod 1: API Gateway (no GPU)
+STT_SERVICE_URL=http://stt-pod:8002
+LLM_SERVICE_URL=http://llm-pod:8005
+
+# Pod 2: LLM only (GPU)
+python -m vllm.entrypoints.openai.api_server --port 8005
+
+# Pod 3: STT/Diarization only (GPU)
+python -m uvicorn src.services.stt.server:app --port 8002
+```
+
+Each service can be scaled independently behind a load balancer.
 
 ## Costs
 
