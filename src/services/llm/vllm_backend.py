@@ -85,8 +85,10 @@ class VLLMBackend(LLMBackend):
         # Build messages
         messages = []
         for msg in request.messages:
+            # Handle both Enum and string role values
+            role = msg.role.value if hasattr(msg.role, 'value') else msg.role
             message_dict: dict[str, Any] = {
-                "role": msg.role.value,
+                "role": role,
             }
             if msg.content is not None:
                 message_dict["content"] = msg.content

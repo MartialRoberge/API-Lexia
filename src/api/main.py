@@ -12,12 +12,32 @@ from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from src.core.config import Settings, get_settings
 from src.core.exceptions import LexiaAPIError
 from src.core.logging import configure_logging, get_logger
-from src.db.session import close_db, init_db
+from src.db.session import close_db, init_db, get_session_maker
 from src.models.common import ErrorDetail, ErrorResponse, HealthResponse
+
+
+class DatabaseMiddleware(BaseHTTPMiddleware):
+    """Middleware to inject database session into request state."""
+
+    async def dispatch(self, request: Request, call_next):
+        """Inject database session into request.state.db."""
+        session_maker = get_session_maker()
+        async with session_maker() as session:
+            request.state.db = session
+            try:
+                response = await call_next(request)
+                await session.commit()
+                return response
+            except Exception:
+                await session.rollback()
+                raise
+            finally:
+                await session.close()
 
 # Import routers
 from src.api.routers import diarization, jobs, llm, stt
@@ -129,6 +149,9 @@ Rate limits are applied per API key. Check response headers:
         allow_methods=settings.cors_allow_methods,
         allow_headers=settings.cors_allow_headers,
     )
+
+    # Database middleware - injects db session into request.state.db
+    app.add_middleware(DatabaseMiddleware)
 
     # Exception handlers
     @app.exception_handler(LexiaAPIError)

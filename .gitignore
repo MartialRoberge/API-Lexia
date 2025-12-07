@@ -140,9 +140,15 @@ tmp/
 *.mp3
 *.m4a
 *.flac
-models/
 *.gguf
 *.safetensors
+
+# ML model weights (but NOT src/models/ which is Python code)
+/models/
+**/models/*.bin
+**/models/*.pt
+**/models/*.onnx
+!src/models/
 
 # Secrets
 *.pem
