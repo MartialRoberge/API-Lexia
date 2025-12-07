@@ -24,13 +24,15 @@ from pydantic import BaseModel
 # -----------------------------------------------------------------------------
 # Configuration from environment
 # -----------------------------------------------------------------------------
-WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "Gilbert-AI/gilbert-fr-source")
-DIARIZATION_MODEL = os.environ.get("DIARIZATION_MODEL", "MEscriva/gilbert-pyannote-diarization")
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "openai/whisper-large-v3")
+DIARIZATION_MODEL = os.environ.get("DIARIZATION_MODEL", "pyannote/speaker-diarization-3.1")
 DEVICE = os.environ.get("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
 COMPUTE_TYPE = os.environ.get("COMPUTE_TYPE", "float16" if DEVICE == "cuda" else "float32")
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 # Use transformers for PyTorch models, faster-whisper for CTranslate2 models
 USE_TRANSFORMERS = os.environ.get("USE_TRANSFORMERS", "true").lower() == "true"
+# Disable diarization preload to avoid memory issues
+ENABLE_DIARIZATION = os.environ.get("ENABLE_DIARIZATION", "false").lower() == "true"
 
 
 # -----------------------------------------------------------------------------
@@ -183,10 +185,13 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"Warning: Could not pre-load Whisper: {e}")
 
-    try:
-        load_diarization()
-    except Exception as e:
-        print(f"Warning: Could not pre-load Diarization: {e}")
+    if ENABLE_DIARIZATION:
+        try:
+            load_diarization()
+        except Exception as e:
+            print(f"Warning: Could not pre-load Diarization: {e}")
+    else:
+        print("Diarization disabled (set ENABLE_DIARIZATION=true to enable)")
 
     yield
 
