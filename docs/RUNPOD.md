@@ -297,13 +297,13 @@ export STORAGE_BACKEND="local"
 export LOCAL_STORAGE_PATH="/workspace/API-Lexia/data"
 export HF_TOKEN="hf_your_huggingface_token_here"
 
-# STT Configuration (transformers backend - more stable)
+# STT Configuration (Gilbert distilled model - 2-4x faster, optimized for French)
 export USE_TRANSFORMERS=true
-export WHISPER_MODEL="openai/whisper-large-v3"
+export WHISPER_MODEL="Gilbert-AI/gilbert-whisper-distil-fr-v0.2"
 export DEVICE=cuda
 
 # Start STT server in background (uses ~3GB GPU)
-echo "[2/5] Starting STT server (Whisper large-v3)..."
+echo "[2/5] Starting STT server (Gilbert-Whisper-Distil-FR)..."
 python -m uvicorn src.services.stt.server:app --host 0.0.0.0 --port 8002 &
 STT_PID=$!
 sleep 15  # Wait for Whisper model to load

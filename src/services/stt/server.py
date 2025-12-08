@@ -24,7 +24,7 @@ from pydantic import BaseModel
 # -----------------------------------------------------------------------------
 # Configuration from environment
 # -----------------------------------------------------------------------------
-WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "openai/whisper-large-v3")
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "Gilbert-AI/gilbert-whisper-distil-fr-v0.2")
 DIARIZATION_MODEL = os.environ.get("DIARIZATION_MODEL", "pyannote/speaker-diarization-3.1")
 DEVICE = os.environ.get("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
 COMPUTE_TYPE = os.environ.get("COMPUTE_TYPE", "float16" if DEVICE == "cuda" else "float32")
@@ -126,12 +126,19 @@ def load_whisper():
     if whisper_model is None:
         if USE_TRANSFORMERS:
             # Use transformers with direct model loading (more stable than pipeline)
-            from transformers import WhisperProcessor, WhisperForConditionalGeneration
+            from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
             print(f"Loading Whisper model (transformers): {WHISPER_MODEL} on {DEVICE}")
 
+            # Use float16 for distilled models on CUDA, float32 for CPU
+            torch_dtype = torch.float16 if DEVICE == "cuda" else torch.float32
+
             # Store processor and model separately for manual transcription
-            processor = WhisperProcessor.from_pretrained(WHISPER_MODEL)
-            model = WhisperForConditionalGeneration.from_pretrained(WHISPER_MODEL).to(DEVICE)
+            processor = AutoProcessor.from_pretrained(WHISPER_MODEL)
+            model = AutoModelForSpeechSeq2Seq.from_pretrained(
+                WHISPER_MODEL,
+                torch_dtype=torch_dtype,
+                low_cpu_mem_usage=True,
+            ).to(DEVICE)
             whisper_model = {"processor": processor, "model": model}
 
             print("Whisper model loaded successfully (transformers)")
@@ -257,15 +264,17 @@ async def transcribe(
             # Load audio with librosa
             audio_array, _ = librosa.load(str(temp_path), sr=16000)
 
-            # Process audio
-            inputs = processor(audio_array, sampling_rate=16000, return_tensors="pt").to(DEVICE)
+            # Process audio and convert to correct dtype
+            inputs = processor(audio_array, sampling_rate=16000, return_tensors="pt")
+            # Match the model's dtype (float16 on CUDA, float32 on CPU)
+            input_features = inputs.input_features.to(DEVICE, dtype=whisper.dtype)
 
             # Generate transcription
             generate_kwargs = {"max_new_tokens": 444, "task": "transcribe"}
             if language:
                 generate_kwargs["language"] = language
 
-            generated_ids = whisper.generate(inputs.input_features, **generate_kwargs)
+            generated_ids = whisper.generate(input_features, **generate_kwargs)
             text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
 
             # Create single segment (transformers direct mode doesn't give timestamps)
