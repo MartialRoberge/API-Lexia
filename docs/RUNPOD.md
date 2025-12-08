@@ -32,11 +32,15 @@ Deploy Lexia API on RunPod GPU cloud.
 Connect via Web Terminal and run:
 
 ```bash
-# Install system dependencies
+# Install ALL system dependencies (DO NOT SKIP!)
 apt-get update
-apt-get install -y python3-pip python3-venv postgresql redis-server ffmpeg libsndfile1 git
+apt-get install -y \
+    python3-pip python3-venv \
+    postgresql redis-server \
+    ffmpeg libsndfile1 \
+    git psmisc lsof
 
-# Install cuDNN 8 (required for faster-whisper with CUDA)
+# Install cuDNN 8 (REQUIRED for faster-whisper CUDA support)
 wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.0-1_all.deb
 dpkg -i cuda-keyring_1.0-1_all.deb
 apt-get update
@@ -129,28 +133,135 @@ mkdir -p /workspace/API-Lexia/data
 ### 5. Initialize Database
 
 ```bash
-cd /workspace/API-Lexia
-source venv/bin/activate
-export PYTHONPATH=/workspace/API-Lexia
-alembic upgrade head
+# Create tables directly (migrations folder is empty)
+PGPASSWORD=lexia123 psql -U lexia -d lexia -h localhost << 'EOF'
+-- API Keys table
+CREATE TABLE IF NOT EXISTS api_keys (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    key_hash VARCHAR(64) UNIQUE NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    user_id VARCHAR(255) NOT NULL,
+    organization_id VARCHAR(255),
+    permissions JSONB,
+    rate_limit INTEGER DEFAULT 60,
+    is_revoked BOOLEAN DEFAULT FALSE NOT NULL,
+    expires_at TIMESTAMP WITH TIME ZONE,
+    last_used_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_api_keys_key_hash ON api_keys(key_hash);
+CREATE INDEX IF NOT EXISTS ix_api_keys_user_id ON api_keys(user_id);
+
+-- Jobs table
+CREATE TABLE IF NOT EXISTS jobs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    type VARCHAR(50) NOT NULL,
+    status VARCHAR(20) DEFAULT 'pending' NOT NULL,
+    priority VARCHAR(10) DEFAULT 'normal' NOT NULL,
+    started_at TIMESTAMP WITH TIME ZONE,
+    completed_at TIMESTAMP WITH TIME ZONE,
+    params JSONB,
+    result JSONB,
+    result_url TEXT,
+    progress_percent INTEGER DEFAULT 0 NOT NULL,
+    progress_message VARCHAR(255),
+    error_code VARCHAR(50),
+    error_message TEXT,
+    retries INTEGER DEFAULT 0 NOT NULL,
+    max_retries INTEGER DEFAULT 3 NOT NULL,
+    webhook_url TEXT,
+    webhook_sent BOOLEAN DEFAULT FALSE NOT NULL,
+    api_key_id UUID REFERENCES api_keys(id) ON DELETE SET NULL,
+    user_id VARCHAR(255),
+    extra_data JSONB,
+    celery_task_id VARCHAR(255) UNIQUE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL
+);
+
+-- Transcriptions table
+CREATE TABLE IF NOT EXISTS transcriptions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    job_id UUID REFERENCES jobs(id) ON DELETE SET NULL,
+    status VARCHAR(20) DEFAULT 'processing' NOT NULL,
+    audio_url TEXT,
+    audio_storage_key VARCHAR(255),
+    audio_duration FLOAT,
+    audio_format VARCHAR(20),
+    language_code VARCHAR(10),
+    language_detected VARCHAR(10),
+    language_confidence FLOAT,
+    speaker_diarization BOOLEAN DEFAULT FALSE NOT NULL,
+    word_timestamps BOOLEAN DEFAULT TRUE NOT NULL,
+    text TEXT,
+    segments JSONB,
+    words JSONB,
+    speakers JSONB,
+    utterances JSONB,
+    diarization_segments JSONB,
+    diarization_stats JSONB,
+    error TEXT,
+    completed_at TIMESTAMP WITH TIME ZONE,
+    processing_time FLOAT,
+    api_key_id UUID REFERENCES api_keys(id) ON DELETE SET NULL,
+    user_id VARCHAR(255),
+    extra_data JSONB,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL
+);
+
+-- Usage records table
+CREATE TABLE IF NOT EXISTS usage_records (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    api_key_id UUID REFERENCES api_keys(id) ON DELETE CASCADE NOT NULL,
+    user_id VARCHAR(255) NOT NULL,
+    timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
+    endpoint VARCHAR(255) NOT NULL,
+    method VARCHAR(10) NOT NULL,
+    tokens_input INTEGER DEFAULT 0 NOT NULL,
+    tokens_output INTEGER DEFAULT 0 NOT NULL,
+    audio_seconds FLOAT DEFAULT 0.0 NOT NULL,
+    status_code INTEGER NOT NULL,
+    latency_ms FLOAT NOT NULL
+);
+
+SELECT 'Tables created successfully!' as status;
+EOF
 ```
 
 ### 6. Create API Key
 
 ```bash
-# Generate hash for API key
+# Méthode simple : utilise le script
+cd /workspace/API-Lexia
+source venv/bin/activate
+export PYTHONPATH=/workspace/API-Lexia
+export API_KEY_SALT="your-salt-16-chars"
+export DATABASE_URL="postgresql+asyncpg://lexia:lexia123@localhost:5432/lexia"
+
+python scripts/create_api_key.py --name "Production Key"
+
+# ⚠️ COPIE LA CLÉ AFFICHÉE ! Elle ne sera plus visible après.
+```
+
+**Alternative manuelle** (si le script ne marche pas) :
+
+```bash
+# 1. Générer la clé et le hash
 python3 << 'EOF'
 import hashlib
-salt = "your-salt-16-chars"  # Must match API_KEY_SALT in .env
-api_key = "lx_your_secure_api_key_here_min_40_chars"
-key_body = api_key[3:]  # Remove "lx_" prefix
-key_hash = hashlib.sha256((salt + key_body).encode()).hexdigest()
-print(f"API Key: {api_key}")
+import secrets
+salt = "your-salt-16-chars"
+random_part = secrets.token_hex(20)
+api_key = f"lx_{random_part}"
+key_hash = hashlib.sha256((salt + api_key[3:]).encode()).hexdigest()
+print(f"Clé API: {api_key}")
 print(f"Hash: {key_hash}")
 EOF
 
-# Insert into database (replace HASH with output from above)
-su - postgres -c "psql -d lexia -c \"INSERT INTO api_keys (id, key_hash, name, user_id, permissions, rate_limit, is_revoked, created_at, updated_at) VALUES (gen_random_uuid(), 'YOUR_HASH_HERE', 'Production Key', 'user-1', '[\\\"*\\\"]', 60, false, now(), now());\""
+# 2. Insérer dans la base (remplace HASH_ICI par le hash affiché)
+su - postgres -c "psql -d lexia -c \"INSERT INTO api_keys (id, key_hash, name, user_id, permissions, rate_limit, is_revoked, created_at, updated_at) VALUES (gen_random_uuid(), 'HASH_ICI', 'Production Key', 'user-1', '[\\\"*\\\"]', 60, false, now(), now());\""
 ```
 
 ### 7. Create Startup Script
@@ -186,9 +297,9 @@ export STORAGE_BACKEND="local"
 export LOCAL_STORAGE_PATH="/workspace/API-Lexia/data"
 export HF_TOKEN="hf_your_huggingface_token_here"
 
-# STT Configuration (faster-whisper with CUDA)
-export USE_TRANSFORMERS=false
-export WHISPER_MODEL="large-v3"
+# STT Configuration (transformers backend - more stable)
+export USE_TRANSFORMERS=true
+export WHISPER_MODEL="openai/whisper-large-v3"
 export DEVICE=cuda
 
 # Start STT server in background (uses ~3GB GPU)
@@ -222,10 +333,15 @@ echo "[4/5] Starting vLLM (this takes 2-3 minutes)..."
 echo "  Model: Marsouuu/general7Bv2-ECE-PRYMMAL-Martial"
 echo "  GPU Memory: 50%"
 
+# Adjust --max-model-len based on your GPU:
+#   - 40GB GPU: 8192
+#   - 48-50GB GPU: 16384
+#   - 80GB GPU: 32768 or remove the parameter
 python -m vllm.entrypoints.openai.api_server \
   --model Marsouuu/general7Bv2-ECE-PRYMMAL-Martial \
   --port 8005 \
-  --gpu-memory-utilization 0.5
+  --gpu-memory-utilization 0.5 \
+  --max-model-len 16384
 
 EOF
 chmod +x /workspace/start.sh
@@ -280,20 +396,25 @@ Find the URL in RunPod > Your Pod > Connect > HTTP Services.
 
 ### GPU Memory Error
 
-If vLLM fails with "Free memory less than desired":
+If vLLM fails with "KV cache memory" or "Free memory less than desired":
 ```bash
 # Kill all Python processes
 pkill -9 -f python
 sleep 3
 
-# Restart with lower memory utilization
+# Restart with max-model-len based on your GPU:
+#   - 40GB GPU: --max-model-len 8192
+#   - 48-50GB GPU: --max-model-len 16384
+#   - 80GB GPU: --max-model-len 32768
 python -m vllm.entrypoints.openai.api_server \
   --model Marsouuu/general7Bv2-ECE-PRYMMAL-Martial \
   --port 8005 \
-  --gpu-memory-utilization 0.7
+  --gpu-memory-utilization 0.5 \
+  --max-model-len 16384
 ```
 
-Or restart the pod from RunPod interface.
+If still failing, try increasing gpu-memory-utilization to 0.6 or 0.7.
+Or restart the pod from RunPod interface to free GPU memory.
 
 ### Database Connection Error
 

@@ -125,15 +125,15 @@ def load_whisper():
     global whisper_model
     if whisper_model is None:
         if USE_TRANSFORMERS:
-            # Use transformers for PyTorch models (like Gilbert-AI/gilbert-fr-source)
-            import transformers
+            # Use transformers with direct model loading (more stable than pipeline)
+            from transformers import WhisperProcessor, WhisperForConditionalGeneration
             print(f"Loading Whisper model (transformers): {WHISPER_MODEL} on {DEVICE}")
-            whisper_model = transformers.pipeline(
-                "automatic-speech-recognition",
-                model=WHISPER_MODEL,
-                torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32,
-                device=DEVICE,
-            )
+
+            # Store processor and model separately for manual transcription
+            processor = WhisperProcessor.from_pretrained(WHISPER_MODEL)
+            model = WhisperForConditionalGeneration.from_pretrained(WHISPER_MODEL).to(DEVICE)
+            whisper_model = {"processor": processor, "model": model}
+
             print("Whisper model loaded successfully (transformers)")
         else:
             # Use faster-whisper for CTranslate2 models
@@ -250,65 +250,36 @@ async def transcribe(
         audio_duration = librosa.get_duration(path=str(temp_path))
 
         if USE_TRANSFORMERS:
-            # Transformers pipeline API
-            generate_kwargs = {}
+            # Use direct model inference (more stable than pipeline)
+            processor = model["processor"]
+            whisper = model["model"]
+
+            # Load audio with librosa
+            audio_array, _ = librosa.load(str(temp_path), sr=16000)
+
+            # Process audio
+            inputs = processor(audio_array, sampling_rate=16000, return_tensors="pt").to(DEVICE)
+
+            # Generate transcription
+            generate_kwargs = {"max_new_tokens": 444, "task": "transcribe"}
             if language:
                 generate_kwargs["language"] = language
 
-            # Run transcription with timestamps
-            result = model(
-                str(temp_path),
-                return_timestamps="word" if word_timestamps else True,
-                generate_kwargs=generate_kwargs,
-            )
+            generated_ids = whisper.generate(inputs.input_features, **generate_kwargs)
+            text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
 
-            # Parse transformers output
-            text = result.get("text", "")
-            chunks = result.get("chunks", [])
-
-            segments: list[TranscriptionSegment] = []
-            all_words: list[TranscriptionWord] = []
-
-            if chunks:
-                for i, chunk in enumerate(chunks):
-                    chunk_text = chunk.get("text", "").strip()
-                    timestamp = chunk.get("timestamp", (0, 0))
-                    start = timestamp[0] if timestamp[0] is not None else 0
-                    end = timestamp[1] if timestamp[1] is not None else start + 0.1
-
-                    if word_timestamps:
-                        word_obj = TranscriptionWord(
-                            text=chunk_text,
-                            start=start,
-                            end=end,
-                            confidence=0.9,
-                        )
-                        all_words.append(word_obj)
-
-                    # Group words into segments (every 10 words or punctuation)
-                    if i % 10 == 0 or chunk_text.endswith(('.', '!', '?')):
-                        segments.append(
-                            TranscriptionSegment(
-                                id=len(segments),
-                                text=chunk_text,
-                                start=start,
-                                end=end,
-                                confidence=0.9,
-                                words=[word_obj] if word_timestamps else None,
-                            )
-                        )
-            else:
-                # No chunks, create single segment
-                segments.append(
-                    TranscriptionSegment(
-                        id=0,
-                        text=text.strip(),
-                        start=0,
-                        end=audio_duration,
-                        confidence=0.9,
-                        words=None,
-                    )
+            # Create single segment (transformers direct mode doesn't give timestamps)
+            segments: list[TranscriptionSegment] = [
+                TranscriptionSegment(
+                    id=0,
+                    text=text.strip(),
+                    start=0,
+                    end=audio_duration,
+                    confidence=0.9,
+                    words=None,
                 )
+            ]
+            all_words: list[TranscriptionWord] = []
 
             return TranscriptionResponse(
                 text=text.strip(),
